@@ -1,0 +1,17 @@
+read("phc.module"):
+#Define a utility to print an abbreviated repository listing.
+listrep := r -> map2( op, 1, march( 'list', r ) ):
+# Create an empty repository.
+fremove("phc.lib"):
+march( 'create', "phc.lib", 100 ):
+listrep( "phc.lib" );
+# Ensure that savelib places m in the correct repository.
+savelibname := ".":
+libname := savelibname, libname:
+savelib( 'phc' ):
+# The listing of the repository now shows that the repository contains not
+# only m, but also two anonymous members that have been given the
+# numeric references 1 and 2.
+listrep( "phc.lib" );
+restart; savelibname := ".": libname := savelibname, libname:
+with(phc);

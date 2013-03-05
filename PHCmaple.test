@@ -1,0 +1,69 @@
+libname := ".", libname:
+with(phc): setPHCloc("."):
+# Cascade
+printf("Testing...\n"):
+printf("cascade...\n"):
+sys := makeSystem([x,y,z],[],[x^2+y^2+(z-1)^2-1, (z-0.5)*(z-1)*y,(z-0.5)*(z-1)*x]): d := 1:
+embsys := embed(sys,d):
+embsols := solve(embsys):
+comps := cascade(embsys,embsols):
+
+# Filter
+printf("filter...\n"):
+filter(comps[d+1], comps[d]):
+ 
+# Decompose
+printf("decompose...\n"):
+topcomps := decompose(comps[d+1]):
+
+# Refine
+printf("refine...\n"):
+sys := makeSystem([x,y],[],[x^2+y^2-1, x+y]):
+sols := solve(sys): 
+refsols := refine(sols,sys,
+digits=32,residual_tol=1e-50,error_tol=1e-51,singular_tol=1e-52,max_iterations=5):
+
+# Positive-dimensional solutions
+printf("embed,solve...\n"):
+sys := makeSystem([x,y,z],[],[x^2+y^2+z^2+1, 4*z^2-1, 2*z-1]):
+s := embed(sys,1):
+sols := solve(s): 
+ 
+# Factor
+printf("factor...\n"):
+p := x^2-y^2:
+factor(p):
+
+# Deflation
+printf("deflation...\n"):
+T := makeSystem([x,y],[],[x^2+y-3, x+0.125*y^2-1.5]):
+sols := solve(T):
+l := deflationStep(sols,T):
+DT := l[2]["deflated system"]: 
+eqns := map(p->p=0,DT:-polys[nops(T:-polys)+1..nops(DT:-polys)]):
+DTmu := subsVariables(DT,[seq(lambda[i]=mu[i],i=1..l[2]["corank"])]): 
+g := deflationStep(l[2]["points"],DTmu)[1]: 
+
+# Equation-by-equation
+printf("equbyequ...\n"):
+sys := makeSystem([x,y,z],[],[x^2+y^2+(z-1)^2-1, (z-0.5)*(z-1)*y,(z-0.5)*(z-1)*x]):
+comps := eqnbyeqn(sys):
+ 
+# Intersection
+printf("intersect...\n"):
+S := makeSystem([x,y,z],[],[x^2+y^2+z^2-4]):
+eS := embed(S,2):
+sols := solve(eS):
+wS := makeWitnessSet(eS, sols):
+C := makeSystem([x,y,z],[],[9*x^2+9*y^2+(z+1)^2-9]):
+eC := embed(C,2):
+sols := solve(eC): 
+wC := makeWitnessSet(eC, sols):
+comp := intersectWitnessSets(wC,wS):
+
+# Bertini
+printf("solve(Bertini)...\n"):
+setPHCloc(".", phc="Bertini"):
+sys := makeSystem([x,y],[],[x^2+y^2-1, x+y]):
+sols := solve(sys): 
+

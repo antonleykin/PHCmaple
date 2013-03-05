@@ -1,0 +1,1097 @@
+phc := module()
+description "PHCpack interface: polynomial homotopy continuation";
+export
+####################### data structures #############################
+        makeSolution,         # point on the variety
+        makeSystem,           # polynomial system
+        makeWitnessSet,       # witness set
+        setPHCloc,             # set path for PHCpack, debug option, etc.
+####################### functions ###################################
+        systemToFile,         # writes the system to a file in PHC format
+        solutionsAppendToFile,# appends solutions to a file in PHC format
+        solve,                # runs the black-box solver
+        embed,                # constructs an embedded system
+        factor,               # performs numerical decomposion
+        track,                # solves and tracks the solution paths
+        drawPaths,            # draws continuation paths
+        refine,               # refines solutions
+        cascade,              # computes the list of equidimensional
+                              # solution components
+        decompose,            # finds the irreducible decomposition
+        filter,               # filters a witness set
+        deflationStep,              # make one deflation step
+        eqnbyeqn,             # equation by equation
+        intersectWitnessSets,
+        makeStartSystem,
+        printSolutions,
+        subsVariables,
+        printSystem,
+        computeResiduals,     # recalculates residuals for a list of solutions
+                              # and (their) system
+	############### Bertini subroutines -------------------------
+	readSolutionsBertini,
+    removeBertiniFiles,
+    makeBertiniInput,
+    makeBertiniStart,
+	solveBertini,	      # same as solve
+	trackBertini;         # uses Bertini as a simple tracker
+####################### locals ######################################
+local
+        D_::integer, # to debug(>0) or not to debug(0),
+                     # >=10 = do not clean up temporary files
+        phcloc::string, # location of PHC executable and .temp directory for temporary files
+        slash::string,  # directory separator (system dependent)
+        phcexe::string,
+        nColors::integer,
+        colorList::array,
+        setup,
+        cleanup,
+        solutionsToFile,
+        getVars,
+        etoE,
+        mysystem, mysystem2,
+        tempFileName,
+        fileToString,
+        parseSolutions,
+        parsePHCsystem,
+        readSolutions,
+    tempFileNameCounter;
+####################### options #####################################
+option
+        package,
+        load = setup,
+        unload = cleanup;
+################ constructors #########################################
+setup := proc()
+local t;
+    D_ := 0; ################## DEBUG level is set here !!! #####
+    phcexe := "phc";
+    phcloc := currentdir();
+    t := kernelopts(platform);
+    if t="dos" or t="windows"
+    then slash := "\\";
+    else slash := "/";
+    fi;
+    userinfo( 1, 'phc[setup]', "PHCmaple loaded!" );
+    NULL
+end proc; #setup
+
+cleanup := proc()
+end proc; #cleanup
+
+setPHCloc := proc(s::string, {debug::integer := 0},
+                  {phc::string := "PHCpack"})
+local t, Defaults, Options, num_reqd;
+    setup(); #!!! have to call this as the package is not loaded automatically
+             #    via read("phc.module")
+    D_ := debug;
+    if phc = "PHCpack" then
+      if D_>0 then phcexe := "phc -0"; fi;
+    elif phc = "Bertini" then
+      phcexe := "bertini";
+    else error "unknown software";
+    fi;
+    t := phcloc;
+    phcloc := s;
+    if not FileTools[Exists](""||phcloc||slash||".tempPHCmaple")
+       then # mkdir "the name of directory in quotes"
+       ssystem("mkdir "||phcloc||slash||".tempPHCmaple");
+    fi;
+    tempFileNameCounter := 0;
+    t
+end proc;
+
+makeSolution := proc(a::list,b::integer,c,d,e,f)
+    if nargs = 1 then
+        Record(`coords`=a, `mult`=1, `time`=0.0, `err`=0.0, `rco`=1.0, `res`=0.0)
+    else
+        Record(`coords`=a, `mult`=b, `time`=c, `err`=d, `rco`=e, `res`=f)
+    end if;
+end proc;
+
+makeSystem := proc(a::list,b::list,c::list)
+        Record(`vars`=a, `slacks`=b, `polys`=expand(c))
+end proc;
+
+makeWitnessSet := proc(a,b::list)
+        Record(`system`=a, `points`=b)
+end proc;
+
+############### mysystem ################################################
+mysystem := proc(s::string)
+  local bat, t, str;
+  t := kernelopts(platform);
+  if t="dos" or t="windows" then
+     bat := tempFileName("bat");
+     fopen(bat,WRITE):
+     fprintf(bat,""||phcloc||slash||s):
+     fclose(bat):
+     ssystem(bat);
+     if D_<10 then
+       fremove(bat);
+     fi;
+  else
+     str := ""||phcloc||slash||s;
+     if D_>=4 then print("LINUX: ssystem("||str||")"); fi;
+     ssystem(str);
+  fi;
+end proc; #mysystem
+
+############### mysystem2 ###############################################
+#### written to bypass a Unix Maple bug
+mysystem2 := proc(s::string, opts::string, input::string, output::string)
+  local bat, t;
+  t := kernelopts(platform);
+  if t="dos" or t="windows" then
+     mysystem(""||s||" "||opts||" < "||input||" > "||output);
+  else
+     bat := ""||phcloc||slash;
+     if D_>0
+     then bat := ""||bat||"PHCmapleUNIXhelper_debug";
+     else bat := ""||bat||"PHCmapleUNIXhelper";
+     fi;
+     bat := ""||bat||" "||phcloc||slash||s||" "||opts||" "||input||" "||output;
+     if D_>=4 then print("UNIXhelper call: "||bat); fi;
+     ssystem(bat);
+  fi;
+end proc; #mysystem2
+
+############### tempFileName ########################################
+tempFileName := proc(s::string)
+    local rs, f;
+    # rs := convert(rand(),string);
+    while true do
+      rs := tempFileNameCounter;
+      f := ""||phcloc||slash||".tempPHCmaple"||slash||rs||"."||s;
+      if not FileTools[Exists](f) then return f; fi;
+      tempFileNameCounter := tempFileNameCounter + 1;
+    od;
+end proc; #tempFileName
+############### getVars #################################################
+getVars := proc(sys) [op(sys:-vars), op(sys:-slacks)];
+end proc; # returns the list of all variables in _sys_
+############### etoE ####################################################
+etoE := proc(s) StringTools[SubstituteAll]( s, "e", "E" );
+end proc; # replaces "e" with "E" in a string
+############### parseSolutions ##########################################
+parseSolutions := proc(s::list,sys)
+  # option trace;
+  local vars;
+  vars := getVars(sys);
+  map(proc(a)
+        # _a_ is a list of form [time=..., multiplicity=...,
+        #     x1=..., ..., xn=..., err=...,  rco=...,  res=...]
+        local p, k, i, b;
+        p := vector(nops(vars));
+        for i from 3 to nops(a)-3 do
+          b := a[i];
+          if not member(op(1,b), vars, 'k')
+            then error "incorrect variable "||b;
+          end if;
+          p[k] := op(2,b);
+        end do;
+        makeSolution(convert(p,list), op(2,a[2]), op(2,a[1]), op(2,a[nops(a)-2]), op(2,a[nops(a)-1]), op(2,a[nops(a)]))
+      end proc, s)
+end proc; #parseSolutions
+############### readSolutions ##########################################
+readSolutions := proc(f::string, system)
+  local sols,mf;
+  mf := tempFileName("readSols"):
+  mysystem(""||phcexe||" -z "||f||" "||mf):
+  read(mf); sols := %;
+  if D_<10 then
+      fremove(mf);
+  fi;
+  parseSolutions(sols,system);
+end proc; #readSolutions
+############### systemToFile ##########################################
+systemToFile := proc(sys, filename::string)
+  local i;
+  fopen(filename,WRITE):
+  if nops(sys:-vars)+nops(sys:-slacks)=nops(sys:-polys) then
+    fprintf(filename,`%d\n`, nops(sys:-polys));
+  else fprintf(filename,`%d %d\n`, nops(sys:-polys),
+                                nops(sys:-vars)+nops(sys:-slacks));
+  end if;
+  for i from 1 to nops(sys:-polys) do
+    fprintf(filename,`%s;\n`,etoE(convert(sys:-polys[i],string))):
+  end do:
+  fclose(filename):
+end proc; #systemToFile
+############### fileToString ########################################
+fileToString := proc(filename::string) # option trace;
+  local res,line;
+  res := "";
+  line := readline(filename);
+  while line <> 0 do
+    res := ""||res||"\n"||line;
+    line := readline(filename);
+  end do;
+  res
+end proc; #fileToString
+############### parsePHCsystem ########################################
+parsePHCsystem := proc(vars::list, slacks::list, s::string) # option trace;
+  local r;
+  r := substring(s,1..(StringTools[FirstFromRight](";",s)-1));
+  r := StringTools[SubstituteAll]( r, ";", "," );
+  r := StringTools[SubstituteAll]( r, "**", "^" );
+  r := StringTools[SubstituteAll]( r, "i", "I" );
+  makeSystem(vars,slacks,[parse(r)])
+end proc; #parsePHCsystem
+############### printSystem ##########################################
+printSystem := proc(sys)
+local i;
+  for i from 1 to nops(sys:-polys) do
+    printf(`(%d) %s\n`, i, convert(sys:-polys[i],string)):
+  end do:
+end proc; #printSystem
+############# computeResiduals ######################################
+computeResiduals := proc(sys, s::list)
+local vars, i;
+  vars := getVars(sys);
+  for i from 1 to nops(s) do
+      s[i]:-res := max(
+          op(map(
+              p->abs(evalf(subs(op(zip((x,y)->x=y, vars,s[i]:-coords)), p))),
+              sys:-polys))
+                      );
+  end do;
+end proc:
+############### subsVariables ##########################################
+subsVariables := proc(sys, sub)
+  makeSystem(subs(sub,sys:-vars), subs(sub,sys:-slacks), subs(sub,sys:-polys))
+end proc; #subsVariables
+############### solutionsToFile ##########################################
+solutionsToFile := proc(sys, s::list, f::string)
+local vars, i, j, str;
+  vars := getVars(sys);
+# writing the file with solutions in Maple format
+  fopen(f,WRITE):
+  fprintf(f, "[");
+  for i from 1 to nops(s) do
+    fprintf(f, "[time = %s,\n multiplicity = %d,",
+                    etoE(convert(s[i]:-time,string)),s[i]:-mult);
+    for j from 1 to nops(vars) do
+         # fprintf(f,"%s = %s + %s*I ",
+         #   convert(vars[j],string),
+         #   etoE( convert(Re(s[i]:-coords[j]),string)),
+         #   etoE( convert(Im(s[i]:-coords[j]),string))
+         #   );
+         fprintf(f,"%s = %s",
+            convert(vars[j],string),
+            etoE( convert(s[i]:-coords[j],string))
+            );
+      if j < nops(vars)
+      then fprintf(f, ", ");
+      else fprintf(f, ",\n err = %s, rco = %s, res = %s]",
+                      etoE(convert(s[i]:-err,string)),
+                      etoE(convert(s[i]:-rco,string)),
+                      etoE(convert(s[i]:-res,string)));
+      end if;
+    end do;
+    if i = nops(s) then fprintf(f,"]");
+    else fprintf(f, " ,\n");
+    end if;
+  end do;
+  fclose(f);
+end proc; #solutionsToFile
+############### solutionsAppendToFile ##########################################
+solutionsAppendToFile := proc(sys, s::list, filename::string)
+  local solfile,cmd;
+  solfile := tempFileName("sols"):
+# writing data to the corresponding files
+  solutionsToFile(sys, s, solfile):
+# converting solutions in Maple format to PHCpack format
+# and appending it to _filename_
+  cmd := ""||phcexe||" -z "||solfile||" "||filename:
+  mysystem(cmd):
+  if D_<10 then
+    fremove(solfile);
+  fi;
+end proc; #solutionsAppendToFile
+
+############### printSolutions ##########################################
+printSolutions := proc(sys, s::list)
+local vars, i;
+  vars := getVars(sys);
+  for i from 1 to nops(s) do
+    printf(`(%d) %s\n`, i, convert([seq(vars[j]=evalf[5](s[i]:-coords[j]),
+                                j=1..nops(vars))],string)):
+  end do;
+end proc; #printSolutions
+############### solve #################################################
+solve := proc(target)
+#  option trace;
+  description `Calls the black-box solver in PHCpack from Maple`:
+# IN:  (system) is a target system;
+# OUT: (list<solution>) is a list of solutions to _target_
+  local i,sols,targetfile,tarsolfile,outfile,startfile,stsolfile:
+
+# call Bertini
+  if phcexe = "bertini" then return solveBertini(target); fi;
+
+# declaring all the file names:
+  tarsolfile := tempFileName("tasols"):
+  targetfile := tempFileName("target"):
+  outfile := tempFileName("output"):
+# writing data to the corresponding files
+  systemToFile(target,targetfile):
+# launching blackbox solver; converting the solutions to the Maple format
+  mysystem(""||phcexe||" -b "||targetfile||" "||outfile):
+  mysystem(""||phcexe||" -z "||targetfile||" "||tarsolfile):
+  read(tarsolfile); sols := %;
+# clean up
+  if D_<10 then
+    fremove(targetfile): fremove(tarsolfile): fremove(outfile):
+  fi;
+# parse and output the solutions
+  parseSolutions(sols, target)
+end proc; # solve
+############### track #################################################
+track := proc( target, start, s::list, n::integer,
+               {max_steps::integer := 0},
+               {condition_hom::integer := 0},
+               {hom_parameter_k::integer := 2},
+               {block_size::integer := 0},
+               {max_step_size::float := -1.},
+               {a_const::complex := 1.+0.*I}
+             )
+  description `Calls the path trackers in PHCpack from Maple`:
+# IN:
+#      (1::system) target system
+#      (2::system) start system
+#      (s::list<solution>) solutions of the start system
+#      (n::integer) number of subdivisions
+# OUT: list<list<solution>> is a list of n+1 "solutions lists"
+  local step,sList,last_sList,h,ii,i,sols,l,r,batchfile,targetfile,tarsolfile,outfile,startfile,stsolfile:
+  if D_ >=4 then
+      printf("Start system:\n");
+      printSystem(start);
+      printf("Start solutions:\n");
+      printSolutions(start, s);
+      printf("Target system:\n");
+      printSystem(target);
+  fi;
+
+# call Bertini
+  if phcexe = "bertini" then return trackBertini(target,start,s); fi;
+
+# declare homotopy
+  sList := [s];
+  h := (t) -> makeSystem(
+                         target:-vars,
+                         target:-slacks,
+                         expand(start:-polys*(1-t) + target:-polys*t)
+                        );
+  if nargs<4 then n := 1; step := 1;
+  else step := 1.0/n;
+  end if;
+  for ii from 0 to n-1 do ##################################
+  i := ii*step;
+# declaring all the file names:
+  tarsolfile := tempFileName("tasols"); stsolfile := tempFileName("ssols"):
+  targetfile := tempFileName("target"): startfile := tempFileName("start"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(h(i+step),targetfile):
+  systemToFile(h(i),startfile):
+  last_sList := sList[nops(sList)];
+  map( proc(s) s:-time := 0; end proc, last_sList): # make sure solutions' "start time" is 0 (phc wants that)
+  solutionsToFile(start, last_sList, stsolfile):
+  map( proc(s) s:-time := i; end proc, last_sList): # make sure solutions' "start time" is corrected
+# converting solutions in Maple format to PHCpack format
+# and appending it to the startfile
+  mysystem(""||phcexe||" -z "||stsolfile||" "||startfile):
+
+# make a batch
+  fopen(batchfile,WRITE):
+  fprintf(batchfile, ""||targetfile||"\n"||outfile||"\n"||"n\n"||startfile||"\n");
+
+  # first menu
+  if hom_parameter_k <> 2
+    then fprintf(batchfile, "k\n%d\n", hom_parameter_k);
+  fi;
+  fprintf(batchfile, "a\n%f\n%f\n", Re(a_const), Im(a_const));
+  fprintf(batchfile, "0\n"); # exit the menu
+
+  # second menu
+  if max_steps > 0 then fprintf(batchfile,"3\n%d\n", max_steps); fi;
+  if condition_hom > 0 then fprintf(batchfile,"1\n%d\n", condition_hom); fi;
+  if block_size < 0 or block_size >= nops(s) # n of paths to track simultaneously
+    then fprintf(batchfile,"2\n%d\n", nops(s)); # ... by default is set to the number of solutions
+    elif block_size > 1 then fprintf(batchfile,"2\n%d\n", block_size);
+  fi;
+  if max_step_size > 0 then
+    if max_step_size < 0.000001 then
+      fprintf(batchfile,"9\n%f\n", max_step_size/2); # minimum change in <t>  ("along path" predictor option)
+    fi;
+    #fprintf(batchfile,"10\n%f\n", max_step_size/2); # minimum change in <t>  ("end game" predictor option)
+    fprintf(batchfile,"11\n%f\n", max_step_size); # maximum change in <t>  ("along path" predictor option)
+    if max_step_size < 0.01
+      then fprintf(batchfile,"12\n%f\n", max_step_size); # maximum change in <t>  ("end game" predictor option)
+    fi;
+  fi;
+  fprintf(batchfile,"0\n0\n"): # exit the menu
+  fclose(batchfile):
+# launching "phc -p"
+  mysystem2(phcexe, "-p", batchfile, "phc.log");
+  mysystem(""||phcexe||" -z "||outfile||" "||tarsolfile):
+  read(tarsolfile): sols := %:
+# clean up
+  if D_<10 then
+  fremove(stsolfile): fremove(tarsolfile):
+  fremove(targetfile): fremove(startfile):
+  fremove(outfile): fremove(batchfile):
+  fi;
+# parse and store the solutions
+  sList := [op(sList), parseSolutions(sols, target)];
+
+  end do; #############################################################
+  if D_ >=4 then
+      printf("Target solutions:\n");
+      printSolutions(target, sList[n+1]);
+  fi;
+  sList
+end proc; # track
+############### drawPaths #################################################
+drawPaths := proc(s::list, sys)  # option trace;
+  description `Calls _track_ and draws the continuation paths coordinate by coordinate`:
+# IN:
+#      (list<solution>)
+#      (system) is a target system;
+# OUT: (list<PLOT>) plots of the paths coord-by-coord
+  local c, nP, i, nPaths, nCoords, curveList, rootList, ret, varname, diskRadius, seqNorms;
+  colorList := [aquamarine, blue, green, gold, khaki,
+                maroon, cyan, brown, navy, turquoise];
+  nColors := nops(colorList);
+  nPaths := nops(s[1]):
+  nCoords := nops(s[1][1]:-coords):
+  c := array(1..nPaths,1..nCoords):
+  for nP from 1 to nPaths do
+  for i from 1 to nCoords do
+    c[nP,i] := map(u->u[nP]:-coords[i], s):
+    # c[nP,i] := remove(u -> abs(u) > 5, c[nP,i]):
+    c[nP,i] := map(u->[Re(u),Im(u)], c[nP,i]):
+  end do; end do;
+  ret := [];
+  for i from 1 to nCoords do
+    curveList := [];
+    rootList := [];
+    for nP from 1 to nPaths do
+      curveList := [op(curveList), plottools[curve](c[nP,i], color=colorList[nP mod nColors + 1])];
+      rootList := [op(rootList),
+            plottools[disk](c[nP,i][nops(c[1,1])], max(c[1,1][nops(c[1,1])][1],1)/50, color=red),
+            plottools[disk](c[nP,i][1], max(c[1,1][nops(c[1,1])][1],1)/50, color=yellow)];
+    end do;
+    varname := op(i,getVars(sys));
+    ret := [op(ret), plots[display](curveList, rootList, title="variable: "||varname)];
+  end do;
+  ret
+end proc; # drawPaths
+
+############### embed #################################################
+embed := proc(sys, d::integer) # option trace;
+  description `Constructs an embedded system for the given system`:
+# IN:
+#      (system) is a system;
+#      (integer) is the expected dimension of the solution set
+# OUT: (system) is the corresponding embedded system
+
+  local i,sols,sysfile,outfile,startfile,batchfile,res,line:
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(sys,sysfile):
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"1\ny\n"||sysfile||"\n"||outfile||"\n%d\nn\n" ,d):
+  fclose(batchfile):
+# launching "phc -c"
+  mysystem2(phcexe, "-c", batchfile, "phc.log"):
+# read the results
+  readline(outfile); # skip the first line containing the number of polys
+  res := fileToString(outfile);
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile):
+    fremove(outfile):
+  fi;
+# return the system in _res_
+  parsePHCsystem(getVars(sys),map(i->zz||i, [seq(i,i=1..d)]),res)
+end proc; # embed
+############### factor #################################################
+factor := proc(p) # option trace;
+  description `Factors a multivariate polynomial`:
+# IN:  a polynomial to factor;
+# OUT: factored polynomial
+  local i,targetfile,outfile,vars,factorfile,L;
+# declaring all the file names:
+  targetfile := tempFileName("target"):
+  outfile := tempFileName("output"):
+# writing data to the corresponding files
+  vars := convert(indets(p),list);
+  systemToFile(makeSystem(vars,[],[p]), targetfile):
+# launching factorization;
+  mysystem(""||phcexe||" -b "||targetfile||" "||outfile):
+#collecting factors
+  L := [];
+  for i from 1 while FileTools[Exists]( ""||targetfile||"_f"||i ) do
+    factorfile := ""||targetfile||"_f"||i;
+    readline(factorfile); # skip the first line containing the number of polys
+    L := [op(L), (parsePHCsystem(vars, [], fileToString(factorfile))):-polys[1]];
+    if D_<10 then
+      fremove(factorfile):
+    fi
+  end do;
+# clean up
+  if D_<10 then
+    fremove(targetfile):
+    fremove(outfile):
+  fi;
+  L
+end proc; # factor
+
+############### refine #################################################
+refine := proc(sols,sys) # option trace;
+  description `Refines specified solutions of a system`:
+# IN:
+#      (list<solution>) the list of solutions to be refined;
+#      (system) is a system;
+# OUT: (list<solution>) the list of refined solutions.
+  local i,sysfile,solfile,outfile,startfile,batchfile,reffile,l,r,refsols;
+
+# call Bertini (returns unrefined solutions!!!)
+  if phcexe = "bertini" then return sols; fi;
+
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  solfile := tempFileName("sol"):
+  batchfile := tempFileName("batch"):
+  reffile := tempFileName("ref");
+# writing data to the corresponding files
+  systemToFile(sys,sysfile):
+  solutionsToFile(sys, sols, solfile):
+# convert solutions and append them to sysfile
+  mysystem(""||phcexe||" -z "||solfile||" "||sysfile):
+# make a batch
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"3\ny\n"||sysfile||"\n"||outfile||"\n"):
+  for i from 3 to nargs do
+    if type(args[i], `=`) then
+        l := op(1,args[i]);
+        r := op(2,args[i]);
+        if l = digits then
+        fprintf(batchfile,"7\n%d\n" ,r):
+        elif l = residual_tol then
+        fprintf(batchfile,"4\n%E\n" ,r):
+        elif l = error_tol then
+        fprintf(batchfile,"3\n%E\n" ,r):
+        elif l = singular_tol then
+        fprintf(batchfile,"5\n%E\n" ,r):
+        elif l = max_iterations then
+        fprintf(batchfile,"6\n%d\n" ,r):
+        else error "refine: wrong option";
+        end if;
+    end if;
+  end do;
+  fprintf(batchfile,"0\n"): # exit the menu
+  fclose(batchfile):
+# launching "phc -v"
+  mysystem2(phcexe, "-v", batchfile, "phc.log"):
+  mysystem(""||phcexe||" -z "||outfile||" "||reffile):
+  read(reffile); refsols := %;
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(solfile):
+    fremove(outfile): fremove(reffile):
+  fi;
+# return refined solutions
+  parseSolutions(refsols, sys)
+end proc; # refine
+
+############### cascade #################################################
+cascade := proc(embsys, embsols::list) # option trace;
+  description `Runs a cascade of homotopies for an embedded positive dimensional system`:
+# IN:
+#      (system) is a EMBEDDED system;
+#      (list<solutions>) the list of solutions to the system;
+# OUT: (list<witness sets>) is a list of witness sets for pure dimensional components
+
+  local i,sols,sysfile,embsolfile,outfile,startfile,batchfile,
+        compfile,compsys,compList,res,newSlacks:
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(embsys,sysfile):
+# append solutions
+  solutionsAppendToFile(embsys, embsols, sysfile);
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"2\n"||sysfile||"\n"||outfile||"\n1\n2\n0\n"):
+  fclose(batchfile):
+# launching "phc -c"
+  mysystem2(phcexe,"-c", batchfile, "phc.log"):
+# read the results
+  compList := [];
+  for i from 0 to nops(embsys:-slacks) do
+    compfile := cat(sysfile,"_sw",convert(i, string));
+    if FileTools[Exists](compfile) then
+        readline(compfile); # skip the first line containing the number of polys
+        res := fileToString(compfile);
+        newSlacks := [op(1..i,embsys:-slacks)];
+        compsys := parsePHCsystem(embsys:-vars,newSlacks,res);
+        compList := [op(compList), makeWitnessSet(compsys,
+                    readSolutions(compfile,compsys))];
+          if D_<10 then
+            fremove(compfile);
+          fi;
+    end if;
+  end do;
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(outfile):
+  fi;
+# return the list of components witness sets
+  compList
+end proc; # cascade
+
+############### decompose #################################################
+decompose := proc(ws) # option trace;
+  description `Runs a cascade of homotopies for a positive dimensional system`:
+# IN:  (witness set) is a witness set for a component of pure dimension;
+# OUT: (list<witness sets>) is the list of witness sets for the irreducible components
+
+  local i,sols,sysfile,embsolfile,outfile,startfile,batchfile,
+        embsys,compfile,compsys,compList,res:
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(ws:-system,sysfile):
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"2\n"||sysfile||"\n"||outfile||"\n1\n0\n"):
+  fclose(batchfile):
+  solutionsAppendToFile(ws:-system,ws:-points,sysfile);
+# launching "phc -f"
+  mysystem2(phcexe, "-f", batchfile, "phc.log"):
+# read the results
+  compList := [];
+  i := 1;
+  while FileTools[Exists]( cat(sysfile,"_f",convert(i, string)) ) do
+    compfile := cat(sysfile,"_f",convert(i, string));
+    readline(compfile); # skip the first line containing the number of polys
+    res := fileToString(compfile);
+    compsys := parsePHCsystem(ws:-system:-vars,ws:-system:-slacks,res);
+    compList := [op(compList), makeWitnessSet(compsys,
+                 readSolutions(compfile,compsys))];
+    i := i + 1;
+    if D_<10 then
+      fremove(compfile);
+    fi;
+  end do;
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(outfile):
+  fi;
+# return the list of components witness sets
+  compList
+end proc; # decompose
+
+############### filter #################################################
+filter := proc(top, ws,
+    {residual_tol::float := -1.},
+    {wit_set_tol::float := -1.}
+    ) # option trace;
+  description `Runs a cascade of homotopies for an embedded positive dimensional system`:
+# IN:
+#      (witness set) top dimensional witness set
+#      (witness set) a witness set
+# OUT: (witness set) the filtered witness set
+
+  local i,sols,sysfile,embsolfile,outfile,solfile,batchfile,newWS:
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  solfile := tempFileName("sol"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(top:-system,sysfile):
+  solutionsAppendToFile(top:-system, top:-points, sysfile);
+  solutionsAppendToFile(ws:-system, ws:-points, solfile);
+# create batch
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"1\n"||sysfile||"\n"||solfile||"\n"||outfile||"\n"):
+  if residual_tol > 0 then
+    fprintf(batchfile,"1\n%f\n", residual_tol); # tolerance for a point to sat. a polynomial
+  fi;
+  if wit_set_tol > 0 then
+    fprintf(batchfile,"2\n%f\n", wit_set_tol); # tolerance for a point to belong to a witness set
+  fi;
+  fprintf(batchfile,"0\n");
+  fclose(batchfile):
+# launch "phc -f"
+  mysystem2(phcexe, "-f", batchfile, "phc.log"):
+# read the results
+  newWS := makeWitnessSet( ws:-system,
+            readSolutions(outfile, ws:-system) );
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(solfile): fremove(outfile):
+  fi;
+# return the list of components witness sets
+  newWS
+end proc; # filter
+
+
+############### eqnbyeqn #################################################
+eqnbyeqn := proc(sys) # option trace;
+  description `Solves the given system equation-by-equation`:
+# IN:
+#      (sys) a system;
+# OUT: (list<witness sets>) is a list of witness sets for pure dimensional components
+
+  local i,sols,sysfile,embsolfile,outfile,startfile,batchfile,
+        compfile,compsys,compList,res,newSlacks:
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(sys,sysfile):
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"y\n"||sysfile||"\n"||outfile||"\nno\n0\nno\n0\n0\n"):
+  fclose(batchfile):
+# launching "phc -a"
+  mysystem2(phcexe, "-a", batchfile, "phc.log"):
+# read the results
+  compList := [];
+  for i from 0 to nops(sys:-vars-1) do
+    compfile := cat(outfile,"_w",convert(i, string));
+    if FileTools[Exists](compfile) then
+        if D_>0 then printf("eqnbyeqn: processing witness set of dim %d\n", i); fi;
+        readline(compfile); # skip the first line containing the number of polys
+        res := fileToString(compfile);
+        newSlacks := [seq(zz||j, j=1..i)];
+        compsys := parsePHCsystem(sys:-vars,newSlacks,res);
+        compList := [op(compList), makeWitnessSet(compsys,
+                    readSolutions(compfile,compsys))];
+          if D_<10 then
+            fremove(compfile);
+          fi;
+    end if;
+  end do;
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(outfile):
+  fi;
+# return the list of components witness sets
+  compList
+end proc; # eqnbyeqn
+
+############### makeStartSystem #################################################
+makeStartSystem := proc(esys) # option trace;
+  local va,n,s_sys,s_sols,i,flag,j,degs;
+  degs := map(p->degree(p),esys:-polys);
+  va := op(esys:-vars),op(esys:-slacks):
+  n := nops(esys:-polys):
+  s_sys := makeSystem([va],[],[seq(expand((1+I)*(va[i]^degs[i]-1)), i=1..n)]):
+  i := vector(n,[seq(0,i=1..n)]):
+  s_sols := []:
+  flag := true:
+  while flag do
+    j := n:
+    s_sols := [op(s_sols), makeSolution([seq(eval(exp(2*Pi*I*i[k]/degs[k])), k=1..n)])]:
+    i[j] := (i[j] + 1) mod degs[j];
+    while flag and i[j]=0 do
+      j := j - 1;
+      if j=1 then flag := false:
+      else
+        i[j] := (i[j] + 1) mod degs[j]:
+      end if:
+    end do:
+  end do:
+  s_sys,s_sols
+end proc; #makeStartSystem
+
+############### deflationStep #########################################
+deflationStep := proc(sols,sys) # option trace;
+  description `Refines specified multiple solutions by making one deflation step`:
+# IN:
+#      (list<solution>) the list of solutions to be refined;
+#      (system) is a system;
+# OUT: (list<"rank" = ...,
+#            "deflated system" = ...,
+#            "points" = list<solution>>)  the list of refined solutions
+#                                         grouped by the rank of their jacobian.
+  local i,sr,sysfile,solfile,outfile,startfile,batchfile,reffile,gfile,searchstring,
+        l,r,pos,refsols,res,nvars,defsys,corank;
+# declaring all the file names:
+  sysfile := tempFileName("system"):
+  outfile := tempFileName("output"):
+  solfile := tempFileName("sol"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(sys,sysfile):
+  solutionsToFile(sys, sols, solfile):
+# convert solutions and append them to sysfile
+  mysystem(""||phcexe||" -z "||solfile||" "||sysfile):
+# make a batch
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,"6\ny\n"||sysfile||"\n"||outfile||"\n1\ny\n3\n1\n"):
+  fprintf(batchfile,"0\n"): # exit the menu
+  fclose(batchfile):
+# launching "phc -v"
+  mysystem2(phcexe, "-v", batchfile, "phc.log"):
+# clean up
+  if D_<10 then
+    fremove(sysfile): fremove(batchfile): fremove(solfile):
+  fi;
+# read the results
+  r := fileToString(outfile);
+  l := [];
+  searchstring := "See the file ";
+  while true do
+    pos := searchtext(searchstring,r);
+    if pos = 0 then break fi;
+    r := substring(r, pos+length(searchstring)..length(r));
+    # get the group filename
+    gfile := substring(r,1..searchtext("\n",r)-1);
+    # 1st line contains the number of polys and the number of vars
+    res := sscanf(readline(gfile),"%d%d");
+    if nops(res)=1 then
+      corank := 0;
+    else corank := res[2] - nops(sys:-vars);
+    fi;
+    res := fileToString(gfile);
+    # lm=lambda
+    res := StringTools[SubstituteAll](res, "lm[1,", "lambda[");
+    # get the deflated system
+    defsys := parsePHCsystem([op(getVars(sys)),seq(lambda[i],i=1..corank)], [], res);
+    reffile := tempFileName("ref");
+    if D_>=3 then
+    print("Parsing: "||phcexe||` -z `||gfile||` `||reffile);
+    fi;
+    mysystem(""||phcexe||` -z `||gfile||` `||reffile);
+    read(reffile); refsols := subs(seq(lm[1,i]=lambda[i],i=1..corank), %);
+    l := [op(l), ["corank" = corank, "deflated system" = defsys, "multipliers" = [seq(lambda[i],i=1..corank)],
+                  "points" = parseSolutions(refsols, defsys)]];
+    if D_<10 then
+      fremove(gfile); fremove(reffile);
+    fi;
+  end do;
+  if D_<10 then
+    fremove(outfile);
+  fi;
+# return refined solutions
+  return map(i->table(i),l);
+end proc; # deflationStep
+
+############### intersectWitnessSets #################################################
+intersectWitnessSets := proc(A, B) # option trace;
+  description `Intersects components represented by two witness sets`:
+# IN:  (A) and (B) are witness sets;
+# OUT: (list<witness sets>) is a list of witness sets for components
+#                           of the intersection
+
+  local i,sols,fileA,fileB,embsolfile,outfile,startfile,batchfile,
+        compfile,compsys,compList,res,newSlacks:
+# declaring all the file names:
+  fileA := tempFileName("compA"):
+  fileB := tempFileName("compB"):
+  outfile := tempFileName("output"):
+  batchfile := tempFileName("batch"):
+# writing data to the corresponding files
+  systemToFile(A:-system,fileA):
+  systemToFile(B:-system,fileB):
+# append solutions
+  solutionsAppendToFile(A:-system, A:-points, fileA);
+  solutionsAppendToFile(B:-system, B:-points, fileB);
+  fopen(batchfile,WRITE):
+  fprintf(batchfile,""||fileA||"\n"||fileB||"\n"||outfile||"\n"):
+  fclose(batchfile):
+# launching "phc -w"
+  mysystem2(phcexe, "-w", batchfile, "phc.log"):
+# read the results
+  compList := [];
+  for i from 0 to nops(A:-system:-slacks) do
+    compfile := cat(outfile,"_w",convert(i, string));
+    if FileTools[Exists](compfile) then
+        readline(compfile); # skip the first line containing the number of polys
+        res := fileToString(compfile);
+        newSlacks := [op(1..i,A:-system:-slacks)];
+        compsys := parsePHCsystem(A:-system:-vars,newSlacks,res);
+        compList := [op(compList), makeWitnessSet(compsys,
+                    readSolutions(compfile,compsys))];
+        if D_<10 then
+          fremove(compfile);
+        fi;
+    end if;
+  end do;
+# clean up
+  if D_<10 then
+    fremove(fileA): fremove(fileB): fremove(batchfile): fremove(outfile):
+  fi;
+# return the list of components witness sets
+  compList
+end proc; # intersectWitnessSets
+
+
+############### makeBertiniInput #####################################
+makeBertiniInput := proc(v::list, T::list, S::list := [])
+# IN:
+#	v = variables
+#	T = polynomials of target system
+# OUT:
+#	f = Bertini input filename
+local f, i, TI, SI;
+  f := "input";
+  fopen(f,WRITE);
+  fprintf(f, "CONFIG\n");
+  fprintf(f, "MPTYPE: 2;\n"); #multiprecision
+  if nops(S) > 0 then
+      fprintf(f, "USERHOMOTOPY: 1;\n");
+  fi;
+  fprintf(f, "\nEND;\n\n");
+  fprintf(f, "INPUT\n\n");
+  if nops(S) > 0 then
+      fprintf(f, "variable ");
+  else fprintf(f, "variable_group ");
+  fi;
+  for i from 1 to nops(v) do
+    if i<nops(v)
+      then fprintf(f, "%s, ", v[i]);
+      else fprintf(f, "%s;\n", v[i]);
+    fi;
+  od;
+  fprintf(f, "function ");
+  for i from 1 to nops(T) do
+      if i<nops(T)
+      then fprintf(f, "f%d, ", i);
+      else fprintf(f, "f%d;\n\n", i);
+      fi;
+  od;
+
+  if nops(S) = 0 then
+      for i from 1 to nops(T) do
+          fprintf(f, "f%d = %s;\n", i, convert(T[i],string));
+      od;
+  else
+      fprintf(f, "pathvariable t;\n");
+      fprintf(f, "parameter s;\n");
+      fprintf(f, "s = t;\n");
+      for i from 1 to nops(T) do
+          TI := T[i];
+          SI := S[i];
+          fprintf(f, "f%d = (%s)*(1-s)+s*(%s);\n",
+                  i, convert(TI,string), convert(SI,string));
+      od;
+  fi;
+
+  fprintf(f, "\nEND\n\n");
+  fclose(f);
+end proc:
+
+############### makeBertiniStart #####################################
+makeBertiniStart := proc(s::list)
+# IN:
+#	s = list of solutions
+local f, i, j, n;
+  f := "start";
+  fopen(f,WRITE);
+  fprintf(f, "%d\n\n", nops(s));
+  for i to nops(s) do
+      n := nops(s[i]);
+      for j to n do
+          fprintf(f, "%e %e;\n", Re(s[i][j]), Im(s[i][j]));
+      od;
+      fprintf(f, "\n");
+  od;
+  fclose(f);
+  return f;
+end proc;
+
+############### readSolutionsBertini ######################################
+readSolutionsBertini := proc(o_files::set)
+local s, temp, nvars, a, f, coords, i;
+  s := [];
+  for f in o_files
+  do;
+      fopen(f, READ);
+      nvars := fscanf(f, "%d")[1];
+      temp := fscanf(f, "%d")[1];
+      temp := fscanf(f, "%d")[1]; #number of the solution, -1 = EOF
+      while temp >= 0 do
+          if D_>=10 then printf("sol[%d] --------------------\n", temp); fi;
+          coords := [];
+          for i from 1 to nvars do
+              a := fscanf(f, "%e %e");
+              coords := [coords[], a[1]+I*a[2]];
+          od;
+          if D_>=10 then print(coords); fi;
+          s := [s[], makeSolution(coords)];
+          temp := fscanf(f, "%d")[1]; #number of the solution, -1 = EOF
+      od;
+      fclose(f);
+  od;
+  return s;
+end proc;
+
+############### solveBertini ##############################################
+solveBertini := proc(target)
+description `Calls Bertini to solve the given system`:
+# IN: (target) is a target system;
+# OUT: (list<solution>) is a list of solutions to _target_
+local sols;
+  # write Bertini files
+  makeBertiniInput( getVars(target), target:-polys);
+  mysystem("bertini");
+  sols := readSolutionsBertini({"finite_solutions"});
+  removeBertiniFiles();
+  return sols;
+end proc; # solve
+
+############### trackBertini ##############################################
+trackBertini := proc( target, start, s::list,
+               {max_steps::integer := 0},
+               {condition_hom::integer := 0},
+               {hom_parameter_k::integer := 2},
+               {block_size::integer := 0},
+               {max_step_size::float := -1.},
+               {a_const::complex := 1.+0.*I}
+             )
+description `Calls the path trackers in Bertini from Maple`:
+# IN:
+#      (1::system) target system
+#      (2::system) start system
+#      (s::list<solution>) solutions of the start system
+# OUT: list<list<solution>> is a list of n+1 "solutions lists"
+local sols;
+    # write Bertini files
+    makeBertiniInput( getVars(target), target:-polys, start:-polys);
+    makeBertiniStart( map(sol->sol:-coords, s) );
+
+    mysystem("bertini");
+    sols := readSolutionsBertini({"raw_solutions"});
+    removeBertiniFiles();
+    return [s, sols];
+end proc; # trackBertini
+
+############## removeBertiniFiles ##################################
+removeBertiniFiles := proc()
+description `Removes Bertini input/output files`;
+local f;
+    for f in {"failed_paths", "nonsingular_solutions",
+              "raw_data", "start", "input", "output", "raw_solutions",
+              "main_data", "real_finite_solutions", "finite_solutions",
+              "midpath_data", "singular_solutions", "real_solutions",
+              "singular_solutions", "midpath_data"} do
+        if FileTools[Exists](f) then FileTools[Remove](f) fi;
+    od;
+end proc;
+
+end module: #phc
